@@ -9,12 +9,9 @@ import shutil
 import pandas as pd
 from collections import defaultdict
 
-
-
-
 def clean_and_process_data(source_path, output_path, selected_classes, not_relevant_classes,
                            img_size=(512, 512), max_samples=None,
-                           max_per_class=5000):
+                           max_per_class=2000):
     source_path = Path(source_path)
     output_path = Path(output_path)
 
@@ -39,184 +36,120 @@ def clean_and_process_data(source_path, output_path, selected_classes, not_relev
                 image_id = mask_path.stem
                 image_class_map[image_id].add(cls)
 
-    # get all RGB and NIR images
-    
     rgb_paths = {Path(p).stem: p for p in glob(str(source_path / "images" / "rgb" / "*.jpg"))}
     nir_paths = {Path(p).stem: p for p in glob(str(source_path / "images" / "nir" / "*.jpg"))}
-
     boundaries = {Path(p).stem: p for p in glob(str(source_path / "boundaries" / "*.png"))}
 
-    # validate existence of RGB and NIR images
     all_image_ids = set(rgb_paths.keys()) & set(nir_paths.keys())
-
-    # ensure the image has at least one relevant class mapped
-
     image_class_map = {
         k: v for k, v in image_class_map.items()
         if k in all_image_ids and any(cls in all_relevant_classes for cls in v)
     }
 
-    # Setup for tracking stats and metadata
     num_selected_classes = len(selected_classes)
-    num_output_channels = num_selected_classes + 1 # Selected classes + 1 merged no-stress channel
-    print(f"Output mask will have {num_output_channels} channels.")
 
-    # Class mapping for selected classes (channels 0 to num_selected_classes-1)
+    print(f"Output mask will have {num_selected_classes} channels.")
+
     selected_class_mapping = {cls: idx for idx, cls in enumerate(selected_classes)}
-    # Index for the merged no-stress channel
-    no_stress_channel_idx = num_selected_classes
 
     stats = {cls: 0 for cls in selected_classes}
-    stats["no_stress_found"] = 0 # Count images with any no-stress class active
+    stats["no_stress_found"] = 0
     csv_data = []
     processed_count = 0
-    # Track samples per selected class for max_per_class limit
     per_selected_class_count = {cls: 0 for cls in selected_classes}
 
     print("\nProcessing images...")
     image_ids_to_process = list(image_class_map.keys())
+    np.random.shuffle(image_ids_to_process)  # Shuffle to randomize processing order
 
     for image_id in tqdm(image_ids_to_process):
         classes_present_in_image = image_class_map[image_id]
-
-        # Check max_per_class limit for selected classes present in this image
-        skip_due_to_limit = False
-        temp_selected_present = set() # Track selected classes before limit check
-
-        for cls in classes_present_in_image:
-            if cls in selected_class_mapping:
-                 # Check if mask file exists and has content before checking limit
-                 mask_path = source_path / "labels" / cls / f"{image_id}.png"
-                 if mask_path.exists():
-                     # Quick check if mask likely has content (optional, could read mask here)
-                     # For simplicity, assume if file exists, it might have content
-                     temp_selected_present.add(cls)
-                 else:
-                     continue # Skip if mask file doesn't exist
-
-        # Now check limits only for classes potentially present
-        for cls in temp_selected_present:
-            if per_selected_class_count[cls] >= max_per_class:
-                skip_due_to_limit = True
-                break
-
-        if skip_due_to_limit:
-            continue
-
-        # Determine if image has any content to process (selected or no-label)
+        output_mask = np.zeros((*img_size, num_selected_classes), dtype=np.uint8)
         has_selected_content = False
         has_no_stress_content = False
-        output_mask = np.zeros((*img_size, num_output_channels), dtype=np.uint8)
-        processed_classes_in_image = set() # Track which classes were actually processed
-
-        # Process selected classes first
-        for cls in list(temp_selected_present): # Iterate over classes confirmed to exist
-            mask_path = source_path / "labels" / cls / f"{image_id}.png"
-            # Re-check existence (though checked above)
-            if mask_path.exists():
-                mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
-                if mask is None: continue # Skip if loading failed
-                mask_resized = cv2.resize(mask, img_size, interpolation=cv2.INTER_NEAREST)
-                binary_mask = (mask_resized > 0).astype(np.uint8)
-
-                if np.any(binary_mask):
-                    class_idx = selected_class_mapping[cls]
-                    output_mask[:, :, class_idx] = binary_mask
-                    has_selected_content = True
-                    processed_classes_in_image.add(cls)
-                    # Increment count only if the class has content and limit not reached
-                    per_selected_class_count[cls] += 1
-
-
-        # Process no-label classes and merge into the last channel
-
+        processed_classes_in_image = set()
         for cls in classes_present_in_image:
+
+            if cls not in selected_class_mapping:
+                continue
+            if per_selected_class_count[cls] >= max_per_class:
+                continue  # Skip if class limit reached
+            mask_path = source_path / "labels" / cls / f"{image_id}.png"
+            if not mask_path.exists():
+                continue
+            mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+            if mask is None:
+                continue
+            mask_resized = cv2.resize(mask, img_size, interpolation=cv2.INTER_NEAREST)
+            binary_mask = (mask_resized > 0).astype(np.uint8)
+            if np.any(binary_mask) > 0:
+                class_idx = selected_class_mapping[cls]
+                output_mask[:, :, class_idx] = binary_mask
+                has_selected_content = True
+                processed_classes_in_image.add(cls)
+                per_selected_class_count[cls] += 1
+
+
             boundarie = cv2.imread(str(boundaries[image_id]), cv2.IMREAD_GRAYSCALE)
-            if boundarie is None: continue
-            boundarie = cv2.resize(boundarie, img_size, interpolation=cv2.INTER_NEAREST)
-            if cls in not_relevant_classes:
-                mask_path = source_path / "labels" / cls / f"{image_id}.png"
-                if mask_path.exists():
-                    mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
-                    if mask is None: continue
-                    mask_resized = cv2.resize(mask, img_size, interpolation=cv2.INTER_NEAREST)
-                    binary_mask = (mask_resized > 0).astype(np.uint8)
-                    boundarie = (boundarie > 0).astype(np.uint8) # Convert to binary
+            if boundarie is not None:
+                boundarie = cv2.resize(boundarie, img_size, interpolation=cv2.INTER_NEAREST)
+
+                boundarie = (boundarie > 0).astype(np.uint8)
+                if stats["no_stress_found"] > max_per_class:
+                    continue
+                for cls in classes_present_in_image:
                     
+                    if cls in not_relevant_classes:
+                        mask_path = source_path / "labels" / cls / f"{image_id}.png"
+                        
+                        if mask_path.exists():
+                            mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+                            if mask is None:
+                                continue
+                            mask_resized = cv2.resize(mask, img_size, interpolation=cv2.INTER_NEAREST)
+                            binary_mask = (mask_resized > 0).astype(np.uint8)
+                            if np.any(binary_mask):
+                                has_no_stress_content = True
 
-                    if np.any(binary_mask):
-                        # Merge into the last channel using logical OR
-                        output_mask[:, :, no_stress_channel_idx] = np.logical_or(
-                            output_mask[:, :, no_stress_channel_idx], boundarie, binary_mask
-                        ).astype(np.uint8)
-                        has_no_stress_content = True
-                        processed_classes_in_image.add(cls) # Track that a no-stress class was processed
-
-
-        # Only save if the image had relevant content and passed limits
         if has_selected_content or has_no_stress_content:
+                    # Load and save image data
+                    rgb = cv2.imread(str(rgb_paths[image_id]))
+                    rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
+                    rgb = cv2.resize(rgb, img_size, interpolation=cv2.INTER_AREA)
+                    nir = cv2.imread(str(nir_paths[image_id]), cv2.IMREAD_GRAYSCALE)
+                    nir = cv2.resize(nir, img_size, interpolation=cv2.INTER_AREA)
+                    rgbn = np.dstack((rgb, nir))
+                    
+                    np.save(inputs_dir / f"{image_id}.npy", rgbn)
+                    np.save(labels_dir / f"{image_id}.npy", output_mask)
+                    record = {"image_id": image_id}
+                    for sel_cls in selected_classes:
+                        record[sel_cls] = int(sel_cls in processed_classes_in_image)
+                    record["no_stress_found"] = int(has_no_stress_content)
+                    csv_data.append(record)
 
-            boundarie = cv2.imread(str(boundaries[image_id]), cv2.IMREAD_GRAYSCALE)
-            if boundarie is None: continue
-            boundarie = cv2.resize(boundarie, img_size, interpolation=cv2.INTER_NEAREST)
+                    for cls in processed_classes_in_image:
+                        if cls in selected_classes:
+                            stats[cls] += 1
+                    if has_no_stress_content:
+                        stats["no_stress_found"] += 1
+
+                    processed_count += 1
             
-            # --- Load Image Data ---
-            rgb = cv2.imread(str(rgb_paths[image_id]))
-            if rgb is None: continue
-            rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
-            rgb = cv2.resize(rgb, img_size, interpolation=cv2.INTER_AREA)
+        if max_samples and processed_count >= max_samples:
+            break
 
-            nir = cv2.imread(str(nir_paths[image_id]), cv2.IMREAD_GRAYSCALE)
-            if nir is None: continue
-            nir = cv2.resize(nir, img_size, interpolation=cv2.INTER_AREA)
-
-            # --- Save Processed Data ---
-            rgbn = np.dstack((rgb, nir))
-            
-            np.save(inputs_dir / f"{image_id}.npy", rgbn)
-            np.save(labels_dir / f"{image_id}.npy", output_mask)
-            np.save(boundaries_dir / f"{image_id}.npy", boundarie)
-
-            # --- Record Metadata ---
-            record = { "image_id": image_id }
-            # Record presence for selected classes processed
-            for sel_cls in selected_classes:
-                 record[sel_cls] = int(sel_cls in processed_classes_in_image)
-            # Record presence for the merged no-stress category
-            record["no_stress_found"] = int(has_no_stress_content)
-            csv_data.append(record)
-
-            # --- Update Global Stats ---
-            for cls in processed_classes_in_image:
-                 if cls in selected_classes:
-                     stats[cls] += 1 # Increment global count for selected classes
-            if has_no_stress_content:
-                stats["no_stress_found"] += 1 # Increment global count for no-stress category
-
-            processed_count += 1
-            if max_samples and processed_count >= max_samples:
-                print(f"\nReached max_samples limit: {max_samples}")
-                break
-
-    # --- Save Metadata and Final Statistics ---
-    if not csv_data:
-        print("\nNo images were processed.")
-        return 0, {}
-    df = pd.DataFrame(csv_data)
-    df.to_csv(output_path / "metadata.csv", index=False)
-
-    print(f"\nFinal statistics (based on images processed):")
-    print(f"Total processed images: {processed_count}") # Use actual processed count
-    # Use accumulated stats dictionary for counts
-    total_processed_for_stats = len(df) # Base percentage on saved images
-    if total_processed_for_stats > 0:
+    # Save metadata and statistics
+    if csv_data:
+        df = pd.DataFrame(csv_data)
+        df.to_csv(output_path / "metadata.csv", index=False)
+        print(f"\nFinal statistics (Total processed: {processed_count}):")
         for cls, count in stats.items():
-             if count > 0:
-                 print(f"- {cls}: {count} images ({count/total_processed_for_stats*100:.1f}%)")
+            print(f"- {cls}: {count} ({count/processed_count*100:.1f}%)")
     else:
-        print("No images included in final statistics.")
+        print("\nNo images processed.")
 
-    return total_processed_for_stats, stats
+    return processed_count, stats
 
 
 if __name__ == "__main__":
